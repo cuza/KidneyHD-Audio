@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stop the old control daemon so its binary can be replaced.
+[ "$3" = "/" ] || exit 0
+launchctl bootout system /Library/LaunchDaemons/dev.cuza.kidneyhd-audiod.plist 2>/dev/null
+exit 0

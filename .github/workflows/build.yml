@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner has no Developer ID, so the Makefile signs ad hoc. Release builds are
+      # signed and notarized locally with `make notarize`.
+      - name: Build driver and control service
+        run: make
+
+      - name: Check both architectures
+        run: |
+          for f in build/KidneyHDAudio.driver/Contents/MacOS/KidneyHDAudio build/kidneyhd-audiod; do
+            for a in arm64 x86_64; do lipo "$f" -verify_arch "$a"; done
+          done
+
+      - name: Build installer
+        run: make pkg
+
+      - name: Build hardware checks
+        run: make build/podtest build/halcheck build/latency
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KidneyHD-Audio-unsigned
+          path: build/KidneyHD-Audio.pkg
