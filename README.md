@@ -60,16 +60,47 @@ control.
 
 The pedal mutes USB playback unless the host keeps reading its control channel, and only one
 program can open that channel. The control service, `kidneyhd-audiod`, holds the channel whenever
-a pedal is attached and shares it, so an editor can run while you play audio through the pedal.
-Editors reach it two ways.
+a pedal is attached and shares it, so any number of editors can run while you play audio through
+the pedal. Any app can use it; it does not have to be KidneyHD.
 
-- The Unix socket `/var/run/kidneyhd-audiod.sock`. Each message in either direction is one length
-  byte followed by one raw USB packet of up to 64 bytes.
-- XPC, for sandboxed editors signed by the same developer team, through the Mach service
-  `ECKB9WN282.dev.cuza.kidney.audiod`. Each message is a dictionary with one raw USB packet under the
-  key `pkt`. A message with `hello` set gets a reply that says whether a pedal is open, in `pedal`,
-  and gives its product ID in `pid`. The reply also carries `serial`, `usbfw` and `licenses` when the
-  pedal reported them.
+### The socket
+
+Connect to the Unix socket `/var/run/kidneyhd-audiod.sock` (any local user can). Messages in both
+directions are one length byte followed by one raw USB packet of that length, up to 64 bytes. A
+USB packet is `[n][0][t][0]` followed by `n` data bytes, `t = 1` for the first packet of a message
+and `t = 4` for the rest; the editor protocol inside is the one POD HD Edit uses.
+
+- Packets you send go to the pedal. The service sends one editor's message whole before the next
+  editor's: while you are partway through a message, other editors' packets wait, so send each
+  message's packets together. If you stop for a second in the middle of a message, the others go on.
+- Every packet the pedal sends goes to every connected editor, including answers to other editors'
+  requests. Match answers to your requests by their contents, and expect messages the pedal sends on
+  its own, such as edits made on its panel.
+- Send a single `0` byte to ask for the hello. The answer comes only to you, as a `0` byte, a
+  little-endian 16-bit length and that many bytes of JSON:
+
+      {"pedal": true, "pid": 16729, "serial": "21PHD0M...", "usbfw": 4160, "licenses": "f8ffffffffffffff"}
+
+  `pedal` says whether a pedal is open and `pid` is its USB product ID (0x4159 for the HD500X).
+  `serial`, `usbfw` (0x1040 for USB firmware 1.04) and `licenses` (the 8 model pack license bytes,
+  where a cleared bit is a licensed pack) appear when the pedal reported them.
+
+A minimal client, in Python:
+
+    import json, socket, struct
+    s = socket.socket(socket.AF_UNIX); s.connect("/var/run/kidneyhd-audiod.sock")
+    s.sendall(b"\0")                                   # hello
+    assert s.recv(1) == b"\0"
+    (n,) = struct.unpack("<H", s.recv(2)); print(json.loads(s.recv(n)))
+
+### XPC
+
+Sandboxed apps cannot open the socket. Apps signed by the same developer team as the service reach
+it through the Mach service `ECKB9WN282.dev.cuza.kidney.audiod`, since a sandbox only allows Mach
+services named after one of the app's App Groups. Each message is a dictionary with one raw USB
+packet under the key `pkt`. A message with `hello` set gets a reply with the same fields as the
+socket's hello, with `licenses` as data. XPC editors share the pedal with socket editors under the
+same rules.
 
 Without the control service, the audio driver keeps reads pending on the control channel itself
 while audio plays, but editors cannot connect.
@@ -111,7 +142,7 @@ If playback is silent or the pedal stops answering the editor:
 - The audio driver runs in Core Audio's sandboxed driver host. Its `Info.plist` asks only for the
   USB user clients it needs.
 - The control service reads the pedal's serial number and model pack license bits. It passes them
-  only to XPC clients, in the `hello` reply, and does not log them.
+  only in the hello reply, to the socket or XPC editor that asked, and does not log them.
 - Release packages carry a Developer ID signature and Apple's notarization. CI builds unsigned
   packages, for testing only.
 

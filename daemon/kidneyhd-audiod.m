@@ -4,8 +4,10 @@
 // Why a daemon: the pedal plays USB audio only while the host keeps reads pending
 // on 0x81, and only one process can own interface 1.
 //
-// Socket protocol, both directions: [length byte][one USB packet of that length].
-// Editor packets go to the pedal; every pedal packet goes to every connected client.
+// Socket protocol, both directions: [length byte][one USB packet of that length]. A lone 0 byte from an editor
+// asks for the hello, answered only to that editor as [0][u16 LE length][JSON].
+// Editor packets go to the pedal, one whole message at a time (arbiter.h); every pedal packet goes to every
+// connected client.
 #import <Foundation/Foundation.h>
 #import <IOUSBHost/IOUSBHost.h>
 #include <IOKit/IOKitLib.h>
@@ -18,6 +20,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
+#include "arbiter.h"
 
 #define LOG(...) os_log(OS_LOG_DEFAULT, "kidneyhd-audiod: %{public}s", [[NSString stringWithFormat:__VA_ARGS__] UTF8String])
 #define READS 16  // same as Line 6's kext
@@ -64,6 +67,78 @@ static void send_to_pedal(const uint8_t *p, size_t n) {
     // Any error but a timeout halts the endpoint, and later writes fail until the stall is cleared.
     if (st != kIOReturnTimeout && pipe == out_pipe) [pipe clearStallWithError:nil];
   }]) LOG(@"write to pedal: %@", err);
+}
+
+// Packets from editors, in arrival order, until the arbiter lets them through: @[editor id, packet].
+// Editor ids are socket fds, or the address of an XPC connection.
+static arbiter_t arbiter;
+static NSMutableArray<NSArray *> *waiting;
+static uint64_t owner_packets;  // packets sent for the current message; a stall check compares it
+
+static void drain(void);
+
+// One second without a packet from an editor partway through a message, while others wait: it is gone or
+// stuck, so the others go on.
+static void check_stall(void) {
+  uint64_t seen = owner_packets;
+  intptr_t owner = arbiter.owner;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), q, ^{
+    if (arbiter.owner != owner || owner_packets != seen || !waiting.count) return;
+    LOG(@"an editor stopped partway through a message; letting the others through");
+    arbiter_release(&arbiter);
+    drain();
+  });
+}
+
+// Sends what the arbiter allows. An editor held behind another's message keeps its later packets in order too.
+static void drain(void) {
+  NSMutableSet *held = [NSMutableSet set];
+  for (NSUInteger i = 0; i < waiting.count;) {
+    NSNumber *editor = waiting[i][0];
+    NSData *pkt = waiting[i][1];
+    if ([held containsObject:editor] || !arbiter_offer(&arbiter, editor.longValue, pkt.bytes, pkt.length)) {
+      [held addObject:editor];
+      i++;
+      continue;
+    }
+    send_to_pedal(pkt.bytes, pkt.length);
+    owner_packets++;
+    [waiting removeObjectAtIndex:i];
+    if (!arbiter.owner && held.count) { [held removeAllObjects]; i = 0; }  // a message ended: the waiting go first
+  }
+  if (arbiter.owner && held.count) check_stall();
+}
+
+static void from_editor(intptr_t editor, const uint8_t *p, size_t n) {
+  if (!n || n > 64) return;
+  [waiting addObject:@[ @(editor), [NSData dataWithBytes:p length:n] ]];
+  drain();
+}
+
+static void editor_left(intptr_t editor) {
+  [waiting filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSArray *e, NSDictionary *b) {
+    return [e[0] longValue] != editor;
+  }]];
+  if (arbiter.owner == editor) {
+    LOG(@"an editor left partway through a message");
+    arbiter_release(&arbiter);
+  }
+  drain();
+}
+
+// What an editor needs before it talks to the pedal: whether one is open, its USB product ID, and, when the pedal
+// reported them, its serial number, USB firmware word and model pack license bytes.
+static NSDictionary *hello(void) {
+  NSMutableDictionary *h = [@{ @"pedal": @(ctl != nil), @"pid": @(ctl ? pedal_pid : 0) } mutableCopy];
+  if (ctl && pedal_serial) h[@"serial"] = pedal_serial;
+  if (ctl && pedal_usb_fw) h[@"usbfw"] = @(pedal_usb_fw);
+  if (ctl && pedal_licenses) {
+    NSMutableString *hex = [NSMutableString string];
+    const uint8_t *b = pedal_licenses.bytes;
+    for (NSUInteger i = 0; i < pedal_licenses.length; i++) [hex appendFormat:@"%02x", b[i]];
+    h[@"licenses"] = hex;
+  }
+  return h;
 }
 
 static void broadcast(const uint8_t *p, size_t n) {
@@ -241,11 +316,23 @@ static void serve_client(int fd) {
     if (n <= 0) { dispatch_source_cancel(src); return; }
     [acc appendBytes:buf length:n];
     const uint8_t *p = acc.bytes; size_t len = acc.length, off = 0;
-    while (off < len && len - off > p[off]) { send_to_pedal(p + off + 1, p[off]); off += 1 + p[off]; }
+    while (off < len) {
+      if (p[off] == 0) {  // hello
+        NSData *json = [NSJSONSerialization dataWithJSONObject:hello() options:0 error:nil];
+        uint8_t head[3] = { 0, (uint8_t)json.length, (uint8_t)(json.length >> 8) };
+        if (write(fd, head, 3) != 3 || write(fd, json.bytes, json.length) != (ssize_t)json.length) shutdown(fd, SHUT_RDWR);
+        off += 1;
+        continue;
+      }
+      if (len - off <= p[off]) break;  // the rest of this packet has not arrived yet
+      from_editor(fd, p + off + 1, p[off]);
+      off += 1 + p[off];
+    }
     [acc replaceBytesInRange:NSMakeRange(0, off) withBytes:NULL length:0];
   });
   dispatch_source_set_cancel_handler(src, ^{
     [clients removeObject:@(fd)];
+    editor_left(fd);
     close(fd);
     LOG(@"editor disconnected (%lu)", (unsigned long)clients.count);
   });
@@ -279,9 +366,10 @@ static void serve_xpc(void) {
       } else if (xpc_get_type(msg) == XPC_TYPE_DICTIONARY) {
         size_t n = 0;
         const void *bytes = xpc_dictionary_get_data(msg, "pkt", &n);
-        if (bytes) send_to_pedal(bytes, n);
+        if (bytes) from_editor((intptr_t)(__bridge void *)peer, bytes, n);
       } else {  // invalidated, interrupted, or refused by the signing requirement
         [xpc_peers removeObject:peer];
+        editor_left((intptr_t)(__bridge void *)peer);
         LOG(@"XPC editor disconnected (%lu)", (unsigned long)xpc_peers.count);
       }
     });
@@ -297,6 +385,7 @@ int main(void) {
     q = dispatch_queue_create("kidneyhd-audiod", DISPATCH_QUEUE_SERIAL);
     clients = [NSMutableSet set];
     xpc_peers = [NSMutableArray array];
+    waiting = [NSMutableArray array];
     signal(SIGPIPE, SIG_IGN);
 
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);

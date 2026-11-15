@@ -1,4 +1,5 @@
 # make                  build the audio plug-in and the control daemon (signed with your Developer ID if found)
+# make unit             checks that need no pedal
 # make test             USB engine check against a plugged-in pedal; the pedal must be free
 #                       (no audio playing through it, control daemon stopped)
 # make check            Core Audio check through the installed plug-in
@@ -32,7 +33,7 @@ PLIST := /Library/LaunchDaemons/dev.cuza.kidneyhd-audiod.plist
 
 all: $(BUNDLE) build/kidneyhd-audiod
 
-build/kidneyhd-audiod: daemon/kidneyhd-audiod.m
+build/kidneyhd-audiod: daemon/kidneyhd-audiod.m daemon/arbiter.h
 	mkdir -p build
 	clang $(CFLAGS) -framework Foundation -framework IOKit -framework IOUSBHost $< -o $@
 	$(SIGN) $@
@@ -50,6 +51,12 @@ $(BUNDLE): src/driver.c src/usb.m src/pod.h src/Info.plist res/KidneyHDAudio.icn
 build/podtest: tools/podtest.m src/usb.m src/pod.h
 	mkdir -p build
 	clang $(CFLAGS) -framework Foundation -framework IOKit -framework IOUSBHost src/usb.m tools/podtest.m -o $@
+
+# make unit: checks that need no pedal.
+unit:
+	mkdir -p build
+	clang -O2 -Wall -Werror tools/arbiter_test.c -o build/arbiter_test
+	build/arbiter_test
 
 test: build/podtest
 	build/podtest 5
@@ -122,4 +129,4 @@ notarize: pkg
 clean:
 	rm -rf build
 
-.PHONY: all test check latency install install-plugin install-daemon uninstall uninstall-daemon pkg notarize clean
+.PHONY: all unit test check latency install install-plugin install-daemon uninstall uninstall-daemon pkg notarize clean
