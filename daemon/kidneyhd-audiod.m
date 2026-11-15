@@ -129,7 +129,7 @@ static void editor_left(intptr_t editor) {
 // What an editor needs before it talks to the pedal: whether one is open, its USB product ID, and, when the pedal
 // reported them, its serial number, USB firmware word and model pack license bytes.
 static NSDictionary *hello(void) {
-  NSMutableDictionary *h = [@{ @"pedal": @(ctl != nil), @"pid": @(ctl ? pedal_pid : 0) } mutableCopy];
+  NSMutableDictionary *h = [@{ @"pedal": ctl ? @YES : @NO, @"pid": @(ctl ? pedal_pid : 0) } mutableCopy];
   if (ctl && pedal_serial) h[@"serial"] = pedal_serial;
   if (ctl && pedal_usb_fw) h[@"usbfw"] = @(pedal_usb_fw);
   if (ctl && pedal_licenses) {
